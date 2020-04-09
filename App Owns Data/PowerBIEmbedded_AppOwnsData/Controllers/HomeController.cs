@@ -1,9 +1,9 @@
 ﻿using Microsoft.IdentityModel.Clients.ActiveDirectory;
-using Microsoft.PowerBI.Api.V2;
-using Microsoft.PowerBI.Api.V2.Models;
+using Microsoft.PowerBI.Api;
+using Microsoft.PowerBI.Api.Models;
 using Microsoft.Rest;
 using PowerBIEmbedded_AppOwnsData.Models;
-using PowerBIEmbedded_AppOwnsData.Services;
+using PowerBIEmbedded_AppOwnsData.Models;
 using System;
 using System.Collections.Generic;
 using System.Configuration;
@@ -32,6 +32,19 @@ namespace PowerBIEmbedded_AppOwnsData.Controllers
                 result.DotNETSDK = assembly.Version.ToString(3);
             }
             return View(result);
+        }
+
+        public async Task<ActionResult> ExportReport()
+        {
+            var embedResult = await m_embedService.ExportReport();
+            if (embedResult)
+            {
+                return File(m_embedService.ExportConfig.File.FileStream, "application/octet-stream", m_embedService.ExportConfig.FileName);
+            }
+            else
+            {
+                return View(m_embedService.ExportConfig);
+            }
         }
 
         public async Task<ActionResult> EmbedReport(string username, string roles)

@@ -1,20 +1,24 @@
 ﻿using Microsoft.IdentityModel.Clients.ActiveDirectory;
-using Microsoft.PowerBI.Api.V2;
-using Microsoft.PowerBI.Api.V2.Models;
+using Microsoft.PowerBI.Api;
+using Microsoft.PowerBI.Api.Models;
 using Microsoft.Rest;
 using PowerBIEmbedded_AppOwnsData.Models;
 using System;
 using System.Collections.Generic;
 using System.Collections.Specialized;
 using System.Configuration;
+using System.IO;
 using System.Linq;
+using System.Net;
+using System.Net.Http;
+using System.Threading;
 using System.Threading.Tasks;
 using System.Web;
 using System.Web.Mvc;
 
-namespace PowerBIEmbedded_AppOwnsData.Services
+namespace PowerBIEmbedded_AppOwnsData.Models
 {
-    public class EmbedService : IEmbedService
+    public partial class EmbedService : IEmbedService
     {
         private static readonly string AuthorityUrl = ConfigurationManager.AppSettings["authorityUrl"];
         private static readonly string ResourceUrl = ConfigurationManager.AppSettings["resourceUrl"];
@@ -30,6 +34,11 @@ namespace PowerBIEmbedded_AppOwnsData.Services
         private static readonly string Username = sectionConfig["pbiUsername"];
         private static readonly string Password = sectionConfig["pbiPassword"];
 
+        public ExportConfig ExportConfig
+        {
+            get { return m_exportConfig; }
+        }
+
         public EmbedConfig EmbedConfig
         {
             get { return m_embedConfig; }
@@ -40,6 +49,7 @@ namespace PowerBIEmbedded_AppOwnsData.Services
             get { return m_tileEmbedConfig; }
         }
 
+        private ExportConfig m_exportConfig;
         private EmbedConfig m_embedConfig;
         private TileEmbedConfig m_tileEmbedConfig;
         private TokenCredentials m_tokenCredentials;
@@ -47,8 +57,184 @@ namespace PowerBIEmbedded_AppOwnsData.Services
         public EmbedService()
         {
             m_tokenCredentials = null;
+            m_exportConfig = new ExportConfig();
             m_embedConfig = new EmbedConfig();
             m_tileEmbedConfig = new TileEmbedConfig();
+        }
+
+        /////// Export sample ///////
+        private async Task<string> PostExportRequest(
+            PowerBIClient client,
+            Guid reportId,
+            Guid groupId,
+            FileFormat format,
+            IList<string> pageNames = null /* Get the page names from the GetPages API */)
+        {
+            var powerBIReportExportConfiguration = new PowerBIReportExportConfiguration
+            {
+                Settings = new ExportReportSettings
+                {
+                    Locale = "en-us",
+                },
+                // Note that page names differ from the page display names.
+                // To get the page names use the GetPages API.
+                Pages = pageNames?.Select(pn => new ExportReportPage(pageName: pn)).ToList(),
+            };
+            var exportRequest = new ExportReportRequest
+            {
+                Format = format,
+                PowerBIReportConfiguration = powerBIReportExportConfiguration,
+            };
+            var export = await client.Reports.ExportToFileInGroupAsync(groupId, reportId, exportRequest);
+            // Save the export ID, you'll need it for polling and getting the exported file
+            return export.Id;
+        }
+
+        private async Task<Export> PollExportRequest(
+            PowerBIClient client,
+            Guid reportId,
+            Guid groupId,
+            string exportId /* Get from the ExportToAsync response */,
+            int timeOutInMinutes,
+            CancellationToken token)
+        {
+            Export exportStatus = null;
+            DateTime startTime = DateTime.UtcNow;
+            const int c_secToMillisec = 1000;
+            do
+            {
+                if (DateTime.UtcNow.Subtract(startTime).TotalMinutes > timeOutInMinutes || token.IsCancellationRequested)
+                {
+                    // Error handling for timeout and cancellations 
+                    return null;
+                }
+                var httpMessage = await client.Reports.GetExportToFileStatusInGroupWithHttpMessagesAsync(groupId, reportId, exportId);
+                exportStatus = httpMessage.Body;
+                // You can track the export progress using the PercentComplete that's part of the response
+                //SomeTextBox.Text = string.Format("{0} (Percent Complete : {1}%)", exportStatus.Status.ToString(), exportStatus.PercentComplete);
+                if (exportStatus.Status == ExportState.Running || exportStatus.Status == ExportState.NotStarted)
+                {
+                    // The recommended waiting time between polling requests can be found in the RetryAfter header
+                    // Note that this header is only populated when the status is either Running or NotStarted
+                    var retryAfter = httpMessage.Response.Headers.RetryAfter;
+                    var retryAfterInSec = retryAfter.Delta.Value.Seconds;
+                    await Task.Delay(retryAfterInSec * c_secToMillisec);
+                }
+            }
+            // While not in a terminal state, keep polling
+            while (exportStatus.Status != ExportState.Succeeded && exportStatus.Status != ExportState.Failed);
+            return exportStatus;
+        }
+
+        private async Task<ExportedFile> GetExportedFile(
+            PowerBIClient client,
+            Guid reportId,
+            Guid groupId,
+            Export export /* Get from the GetExportStatusAsync response */)
+        {
+            if (export.Status == ExportState.Succeeded)
+            {
+                var fileStream = await client.Reports.GetFileOfExportToFileAsync(groupId, reportId, export.Id);
+                return new ExportedFile
+                {
+                    FileStream = fileStream,
+                    FileSuffix = export.ResourceFileExtension,
+                };
+            }
+            return null;
+        }
+
+        private async Task<ExportedFile> ExportPowerBIReport(
+            PowerBIClient client,
+            Guid reportId,
+            Guid groupId,
+            FileFormat format,
+            int pollingtimeOutInMinutes,
+            CancellationToken token,
+            IList<string> pageNames = null /* Get the page names from the GetPages API */)
+        {
+            try
+            {
+                var exportId = await PostExportRequest(client, reportId, groupId, format, pageNames);
+                var export = await PollExportRequest(client, reportId, groupId, exportId, pollingtimeOutInMinutes, token);
+                if (export == null || export.Status != ExportState.Succeeded)
+                {
+                    // Error, failure in exporting the report
+                    return null;
+                }
+                return await GetExportedFile(client, reportId, groupId, export);
+            }
+            catch
+            {
+                // Error handling
+                throw;
+            }
+        }
+
+        public async Task<bool> ExportReport()
+        {
+            // Get token credentials for user
+            var getCredentialsResult = await GetTokenCredentials();
+            if (!getCredentialsResult)
+            {
+                // The error message set in GetTokenCredentials
+                return false;
+            }
+
+            try
+            {
+                // Create a Power BI Client object. It will be used to call Power BI APIs.
+                using (var client = new PowerBIClient(new Uri(ApiUrl), m_tokenCredentials))
+                {
+                    // Get a list of reports.
+                    var reports = await client.Reports.GetReportsInGroupAsync(new Guid(WorkspaceId));
+
+                    // No reports retrieved for the given workspace.
+                    if (reports.Value.Count() == 0)
+                    {
+                        m_embedConfig.ErrorMessage = "No reports were found in the workspace";
+                        return false;
+                    }
+
+                    Report report;
+                    if (string.IsNullOrWhiteSpace(ReportId))
+                    {
+                        // Get the first report in the workspace.
+                        report = reports.Value.FirstOrDefault();
+                    }
+                    else
+                    {
+                        report = reports.Value.FirstOrDefault(r => r.Id.ToString().Equals(ReportId, StringComparison.InvariantCultureIgnoreCase));
+                    }
+
+                    if (report == null)
+                    {
+                        m_embedConfig.ErrorMessage = "No report with the given ID was found in the workspace. Make sure ReportId is valid.";
+                        return false;
+                    }
+
+                    CancellationToken token = new CancellationToken();
+
+                    ExportedFile file = await ExportPowerBIReport(
+                        client,
+                        report.Id,
+                        new Guid(WorkspaceId),
+                        FileFormat.PPTX,
+                        3,
+                        token
+                        );
+
+                    m_exportConfig.File = file;
+                    m_exportConfig.FileName = String.Concat(report.Name, file.FileSuffix);
+                }
+            }
+            catch (HttpOperationException exc)
+            {
+                m_exportConfig.ErrorMessage = string.Format("Status: {0} ({1})\r\nResponse: {2}\r\nRequestId: {3}", exc.Response.StatusCode, (int)exc.Response.StatusCode, exc.Response.Content, exc.Response.Headers["RequestId"].FirstOrDefault());
+                return false;
+            }
+
+            return true;
         }
 
         public async Task<bool> EmbedReport(string username, string roles)
@@ -68,7 +254,7 @@ namespace PowerBIEmbedded_AppOwnsData.Services
                 using (var client = new PowerBIClient(new Uri(ApiUrl), m_tokenCredentials))
                 {
                     // Get a list of reports.
-                    var reports = await client.Reports.GetReportsInGroupAsync(WorkspaceId);
+                    var reports = await client.Reports.GetReportsInGroupAsync(new Guid(WorkspaceId));
 
                     // No reports retrieved for the given workspace.
                     if (reports.Value.Count() == 0)
@@ -85,7 +271,7 @@ namespace PowerBIEmbedded_AppOwnsData.Services
                     }
                     else
                     {
-                        report = reports.Value.FirstOrDefault(r => r.Id.Equals(ReportId, StringComparison.InvariantCultureIgnoreCase));
+                        report = reports.Value.FirstOrDefault(r => r.Id.ToString().Equals(ReportId, StringComparison.InvariantCultureIgnoreCase));
                     }
 
                     if (report == null)
@@ -94,7 +280,7 @@ namespace PowerBIEmbedded_AppOwnsData.Services
                         return false;
                     }
 
-                    var datasets = await client.Datasets.GetDatasetByIdInGroupAsync(WorkspaceId, report.DatasetId);
+                    var datasets = await client.Datasets.GetDatasetInGroupAsync(new Guid(WorkspaceId), report.DatasetId);
                     m_embedConfig.IsEffectiveIdentityRequired = datasets.IsEffectiveIdentityRequired;
                     m_embedConfig.IsEffectiveIdentityRolesRequired = datasets.IsEffectiveIdentityRolesRequired;
                     GenerateTokenRequest generateTokenRequestParameters;
@@ -117,7 +303,7 @@ namespace PowerBIEmbedded_AppOwnsData.Services
                         generateTokenRequestParameters = new GenerateTokenRequest(accessLevel: "view");
                     }
 
-                    var tokenResponse = await client.Reports.GenerateTokenInGroupAsync(WorkspaceId, report.Id, generateTokenRequestParameters);
+                    var tokenResponse = await client.Reports.GenerateTokenInGroupAsync(new Guid(WorkspaceId), report.Id, generateTokenRequestParameters);
 
                     if (tokenResponse == null)
                     {
@@ -128,7 +314,7 @@ namespace PowerBIEmbedded_AppOwnsData.Services
                     // Generate Embed Configuration.
                     m_embedConfig.EmbedToken = tokenResponse;
                     m_embedConfig.EmbedUrl = report.EmbedUrl;
-                    m_embedConfig.Id = report.Id;
+                    m_embedConfig.Id = report.Id.ToString();
                 }
             }
             catch (HttpOperationException exc)
@@ -156,7 +342,7 @@ namespace PowerBIEmbedded_AppOwnsData.Services
                 using (var client = new PowerBIClient(new Uri(ApiUrl), m_tokenCredentials))
                 {
                     // Get a list of dashboards.
-                    var dashboards = await client.Dashboards.GetDashboardsInGroupAsync(WorkspaceId);
+                    var dashboards = await client.Dashboards.GetDashboardsInGroupAsync(new Guid(WorkspaceId));
 
                     // Get the first report in the workspace.
                     var dashboard = dashboards.Value.FirstOrDefault();
@@ -169,7 +355,7 @@ namespace PowerBIEmbedded_AppOwnsData.Services
 
                     // Generate Embed Token.
                     var generateTokenRequestParameters = new GenerateTokenRequest(accessLevel: "view");
-                    var tokenResponse = await client.Dashboards.GenerateTokenInGroupAsync(WorkspaceId, dashboard.Id, generateTokenRequestParameters);
+                    var tokenResponse = await client.Dashboards.GenerateTokenInGroupAsync(new Guid(WorkspaceId), dashboard.Id, generateTokenRequestParameters);
 
                     if (tokenResponse == null)
                     {
@@ -182,7 +368,7 @@ namespace PowerBIEmbedded_AppOwnsData.Services
                     {
                         EmbedToken = tokenResponse,
                         EmbedUrl = dashboard.EmbedUrl,
-                        Id = dashboard.Id
+                        Id = dashboard.Id.ToString()
                     };
 
                     return true;
@@ -212,7 +398,7 @@ namespace PowerBIEmbedded_AppOwnsData.Services
                 using (var client = new PowerBIClient(new Uri(ApiUrl), m_tokenCredentials))
                 {
                     // Get a list of dashboards.
-                    var dashboards = await client.Dashboards.GetDashboardsInGroupAsync(WorkspaceId);
+                    var dashboards = await client.Dashboards.GetDashboardsInGroupAsync(new Guid(WorkspaceId));
 
                     // Get the first report in the workspace.
                     var dashboard = dashboards.Value.FirstOrDefault();
@@ -223,14 +409,14 @@ namespace PowerBIEmbedded_AppOwnsData.Services
                         return false;
                     }
 
-                    var tiles = await client.Dashboards.GetTilesInGroupAsync(WorkspaceId, dashboard.Id);
+                    var tiles = await client.Dashboards.GetTilesInGroupAsync(new Guid(WorkspaceId), dashboard.Id);
 
                     // Get the first tile in the workspace.
                     var tile = tiles.Value.FirstOrDefault();
 
                     // Generate Embed Token for a tile.
                     var generateTokenRequestParameters = new GenerateTokenRequest(accessLevel: "view");
-                    var tokenResponse = await client.Tiles.GenerateTokenInGroupAsync(WorkspaceId, dashboard.Id, tile.Id, generateTokenRequestParameters);
+                    var tokenResponse = await client.Tiles.GenerateTokenInGroupAsync(new Guid(WorkspaceId), dashboard.Id, tile.Id, generateTokenRequestParameters);
 
                     if (tokenResponse == null)
                     {
@@ -243,8 +429,8 @@ namespace PowerBIEmbedded_AppOwnsData.Services
                     {
                         EmbedToken = tokenResponse,
                         EmbedUrl = tile.EmbedUrl,
-                        Id = tile.Id,
-                        dashboardId = dashboard.Id
+                        Id = tile.Id.ToString(),
+                        dashboardId = dashboard.Id.ToString()
                     };
 
                     return true;

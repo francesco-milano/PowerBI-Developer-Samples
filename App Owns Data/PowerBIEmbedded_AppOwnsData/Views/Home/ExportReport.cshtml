@@ -1,0 +1,44 @@
+﻿@model PowerBIEmbedded_AppOwnsData.Models.ExportConfig
+
+@{
+    ViewBag.Title = "Index";
+    Layout = "~/Views/Shared/_Layout.cshtml";
+}
+
+<script src="https://npmcdn.com/es6-promise@3.2.1"></script>
+<script src="~/scripts/powerbi.js"></script>
+
+@if (!string.IsNullOrEmpty(Model.ErrorMessage))
+{
+    <div id="errorWrapper">
+        <h2>
+            Error
+        </h2>
+        <pre>
+            @Model.ErrorMessage
+        </pre>
+    </div>
+
+    return;
+}
+
+<h2>Export Report</h2>
+<div>
+    Export Report result.<br/><br/>
+        @using (Html.BeginForm())
+        {
+            <div>
+                <h8>Report file suffix:</h8>
+                @Model.File.FileSuffix
+            </div>
+        }
+</div>
+<div id="embedContainer"></div>
+
+<div class="infoBox">
+    Code is in files:<br />
+    1) HomeController.cs<br />
+    2) ExportReport.cshtml
+</div>
+
+@Html.Partial("LiveDemoLink")

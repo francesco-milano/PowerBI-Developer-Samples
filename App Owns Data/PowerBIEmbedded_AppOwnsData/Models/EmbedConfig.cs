@@ -1,4 +1,4 @@
-﻿using Microsoft.PowerBI.Api.V2.Models;
+﻿using Microsoft.PowerBI.Api.Models;
 using System;
 
 namespace PowerBIEmbedded_AppOwnsData.Models
@@ -15,7 +15,7 @@ namespace PowerBIEmbedded_AppOwnsData.Models
         {
             get
             {
-                var minutesToExpiration = EmbedToken.Expiration.Value - DateTime.UtcNow;
+                var minutesToExpiration = EmbedToken.Expiration - DateTime.UtcNow;
                 return (int) minutesToExpiration.TotalMinutes;
             }
         }
